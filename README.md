@@ -27,11 +27,38 @@ Supported branches:
 
 ## Requirements
 
-- Linux, x86_64 (ARM builds are skipped)
-- Python 3.8 or newer (3.12+ recommended)
-- `zstd` only if you install a release that ships solely as `.tar.zst`
+protonmgr has **no third-party Python packages**. Everything it imports ships
+with Python itself, so there is nothing to `pip install`.
 
-## Usage
+| Needed | Why | Notes |
+| --- | --- | --- |
+| Linux on x86_64 | Proton builds are for 64-bit x86 Linux | ARM and "signed" builds are skipped |
+| Python 3.8 or newer | Runs the program | Developed and tested on 3.13. Python must include the standard `lzma` module (normal on distro packages), because CachyOS and DW Proton ship `.tar.xz` files |
+| Steam | Where the installed Proton versions get used | Native or Flatpak. Steam does not need to be running, and the `compatibilitytools.d` folder is created if it is missing |
+| Internet access | Fetches release lists and downloads | Needs `api.github.com` and GitHub's release downloads. `dawn.wine` is tried first for DW Proton, with GitHub as the fallback |
+| `git` | Only to clone this repo | Not needed if you download the file directly |
+| `zstd` and `tar` | Only for a release that ships solely as `.tar.zst` | Most releases use `.tar.gz` or `.tar.xz` and never need it. If it is missing, the tool tells you |
+
+Disk space: each version is roughly 500 MB to download and over 1 GB once
+extracted (CachyOS builds are around 1.4 GB), so keep a few GB free. Downloads
+go to `~/.cache/protonmgr` and are deleted after each install.
+
+## Installation
+
+Install the few system packages first (skip any you already have):
+
+```sh
+# Arch / CachyOS / Manjaro
+sudo pacman -S python git zstd
+
+# Debian / Ubuntu / Mint
+sudo apt install python3 git zstd
+
+# Fedora
+sudo dnf install python3 git zstd
+```
+
+Then get the program:
 
 ```sh
 git clone https://github.com/FNGHobo/Proton-Manager.git
@@ -39,12 +66,25 @@ cd Proton-Manager
 python3 protonmgr.py
 ```
 
-To run it as `protonmgr` from anywhere:
+Or download just the one file and run it:
+
+```sh
+curl -LO https://raw.githubusercontent.com/FNGHobo/Proton-Manager/main/protonmgr.py
+python3 protonmgr.py
+```
+
+To run it as `protonmgr` from anywhere (assumes `~/.local/bin` is on your `PATH`):
 
 ```sh
 chmod +x protonmgr.py
 ln -s "$PWD/protonmgr.py" ~/.local/bin/protonmgr
 ```
+
+To update later, run `git pull` inside the cloned folder.
+
+## Usage
+
+Start it with `python3 protonmgr.py` (or `protonmgr` if you linked it as above).
 
 Menu keys: type a number to open an entry, `b` goes back, `q` quits. In a
 release list, type numbers or ranges to toggle them, `a` toggles everything not
