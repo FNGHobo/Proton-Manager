@@ -13,17 +13,26 @@ Supported branches:
 
 ## Features
 
-- Lists the Proton versions you already have installed.
-- Browses each branch's online releases, page by page, and marks the ones you
-  already have with `[installed]`.
-- Multi-select: pick several releases at once (`1 3 5-7`) into a download queue
-  that is kept while you change pages or switch branches, then install the whole
-  queue in one go.
+- **Arrow-key interface:** move with the arrow keys, select with Space, confirm
+  with Enter. No typing numbers.
+- Lists what you have installed, with the size of each version on disk.
+- Browses each branch's online releases in one scrolling list (more load as you
+  reach the bottom) and marks the ones you already have with `[installed]`.
+- **Multi-select download queue:** pick several releases with Space. The queue is
+  kept while you scroll, filter, or jump between branches, then installs all at
+  once.
+- **Check for updates:** shows the newest stable release of each branch and
+  whether you have it, and can queue the missing ones in one key.
+- **Filter** releases by name, show or hide pre-releases, and read each
+  release's **notes** before installing.
+- **Cleanup:** select several installed versions and delete them in one go, or
+  let it pre-select the older ones (everything except the newest two of each
+  branch; folders it doesn't recognise are never selected).
 - Verifies the published checksum (sha512/sha256) before installing, and
-  extracts into a staging folder first so a failed install never leaves a
+  extracts into a staging folder first, so a failed install never leaves a
   half-unpacked version behind.
 - Picks the right CachyOS build (`x86_64`, `x86_64_v3`, `x86_64_v4`) for your CPU.
-- Removes installed versions, with a typed confirmation.
+- Scriptable: `--list` and `--latest BRANCH` work without the interface.
 
 ## Requirements
 
@@ -33,9 +42,11 @@ with Python itself, so there is nothing to `pip install`.
 | Needed | Why | Notes |
 | --- | --- | --- |
 | Linux on x86_64 | Proton builds are for 64-bit x86 Linux | ARM and "signed" builds are skipped |
-| Python 3.8 or newer | Runs the program | Developed and tested on 3.13. Python must include the standard `lzma` module (normal on distro packages), because CachyOS and DW Proton ship `.tar.xz` files |
+| A normal terminal | The arrow-key interface uses Python's built-in `curses` module | Any common Linux terminal works. It needs to be a real terminal, so it won't run from a pipe or cron job (use `--list` / `--latest` for those) |
+| Python 3.8 or newer | Runs the program | Tested on 3.11, 3.12 and 3.13; the code only uses features that exist in 3.8, but older versions haven't been run. Python must include the standard `lzma` module (normal on distro packages), because CachyOS and DW Proton ship `.tar.xz` files |
 | Steam | Where the installed Proton versions get used | Native or Flatpak. Steam does not need to be running, and the `compatibilitytools.d` folder is created if it is missing |
 | Internet access | Fetches release lists and downloads | Needs `api.github.com` and GitHub's release downloads. `dawn.wine` is tried first for DW Proton, with GitHub as the fallback |
+| `pgrep` (from `procps`) | Optional | Only used to tell you whether Steam is running and needs a restart |
 | `git` | Only to clone this repo | Not needed if you download the file directly |
 | `zstd` and `tar` | Only for a release that ships solely as `.tar.zst` | Most releases use `.tar.gz` or `.tar.xz` and never need it. If it is missing, the tool tells you |
 
@@ -85,14 +96,53 @@ To update later, run `git pull` inside the cloned folder.
 ## Usage
 
 Start it with `python3 protonmgr.py` (or `protonmgr` if you linked it as above).
+The available keys are always listed at the bottom of the screen.
 
-Menu keys: type a number to open an entry, `b` goes back, `q` quits. In a
-release list, type numbers or ranges to toggle them, `a` toggles everything not
-yet installed on the page, `n`/`p` change page, `v` views the queue, `i`
-installs it, and `r` refreshes the list.
+**Everywhere**
 
-After installing, restart Steam and choose the version under a game's
-Properties > Compatibility.
+| Key | Does |
+| --- | --- |
+| Up / Down (or `k` / `j`) | Move |
+| PgUp / PgDn, Home / End | Jump |
+| Enter | Open or confirm |
+| Esc (or `q`, Left) | Go back |
+
+**Browsing a branch**
+
+| Key | Does |
+| --- | --- |
+| Space | Select or unselect a version (it joins the queue) |
+| Enter | Install the queue, or the highlighted version if nothing is selected |
+| `i` or Right | Read the release notes |
+| `/` | Filter by name (Esc clears it) |
+| `a` | Select every version on screen that isn't installed yet |
+| `p` | Show or hide pre-releases |
+| `v` | View the queue |
+| `r` | Refresh the list |
+
+**Installed versions**
+
+| Key | Does |
+| --- | --- |
+| Space | Select a version |
+| `a` | Select all |
+| `o` | Select old versions (all but the newest two of each branch) |
+| `d` | Delete the selected versions, or the highlighted one if none are selected |
+
+Installing asks for confirmation first and shows the total download size. While
+files download, the interface steps aside so you can see normal progress output,
+then returns. After installing, restart Steam and choose the version under a
+game's Properties > Compatibility.
+
+## Command line
+
+| Command | Does |
+| --- | --- |
+| `protonmgr` | Open the interface |
+| `protonmgr --list` | Print the installed versions and exit |
+| `protonmgr --latest ge` | Install the newest stable release of a branch (`ge`, `cachyos` or `dw`) and exit. Does nothing if you already have it |
+| `protonmgr --dir PATH` | Manage a different `compatibilitytools.d` folder |
+| `protonmgr --version` | Print the version |
 
 ## Where it installs
 
