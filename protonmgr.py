@@ -3,8 +3,8 @@
 
 What it does
 ------------
-* Lists the Proton versions installed in Steam's compatibilitytools.d folder,
-  with their size on disk.
+* Lists the Proton versions installed in every Steam compatibilitytools.d
+  folder it can find (native + Flatpak), with their size on disk.
 * Browses the online releases of GE-Proton, Proton-CachyOS and DW Proton in a
   scrolling list (more load as you scroll), marking what is already installed.
 * Select several releases with Space; the selection (the "queue") is kept while
@@ -13,6 +13,9 @@ What it does
   into compatibilitytools.d.
 * Reads release notes, filters by name, checks for newer releases, and removes
   or bulk-cleans old versions.
+* `--check-updates` reports branches with newer releases, fires a desktop
+  notification (via `notify-send`, optional), and exits 2 if any are available,
+  so it slots into a systemd timer or cron job.
 
 Keys (shown at the bottom of every screen)
 ------------------------------------------
@@ -22,18 +25,29 @@ Command line
 ------------
   protonmgr                  interactive interface
   protonmgr --list           print installed versions
+  protonmgr --check-updates  report newer releases (exit 2 if any)
   protonmgr --latest ge      install the newest stable release of a branch
                              (ge, cachyos or dw)
   protonmgr --dir PATH       manage another compatibilitytools.d folder
 
 Only the Python standard library is used (Python 3.8+; 3.12+ recommended).
+Desktop notifications require `notify-send` (libnotify); without it
+`--check-updates` still prints and exits 2, it just does not pop a bubble.
 
 Where it installs
 -----------------
-The first existing Steam folder from this list is used:
-  ~/.local/share/Steam, ~/.steam/steam, ~/.steam/root, Flatpak Steam.
-Override with `--dir PATH` or the PROTONMGR_DIR environment variable
-(PATH must be the compatibilitytools.d folder itself).
+All of these Steam folders are scanned for installed versions (first existing
+one is preferred for new installs):
+  ~/.local/share/Steam, ~/.steam/steam, ~/.steam/root,
+  ~/.var/app/com.valvesoftware.Steam/.local/share/Steam (Flatpak)
+
+Overrides, in order of priority:
+  * --dir PATH                 (single folder; disables auto-detect)
+  * PROTONMGR_DIRS=P1:P2:...   (colon-separated list; P1 is the install target)
+  * PROTONMGR_DIR=PATH         (single folder; install target + scan root)
+
+`--dir` and PROTONMGR_DIR must point at the compatibilitytools.d folder
+itself. PROTONMGR_DIRS paths are the same.
 
 Adding another Proton branch
 ----------------------------
@@ -70,7 +84,7 @@ from pathlib import Path
 # --------------------------------------------------------------------------
 
 APP_NAME = "protonmgr"
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 USER_AGENT = f"{APP_NAME}/1.0 (terminal Proton version manager)"
 PAGE_SIZE = 30            # releases fetched per request when browsing online
 HTTP_TIMEOUT = 30         # seconds before a network request gives up
@@ -135,8 +149,6 @@ SOURCES = [
     Source(
         key="dw",
         label="DW Proton (Dawn Winery)",
-        # dawn.wine sits behind a bot-check that can reject scripts, so the
-        # official GitHub mirror is used as an automatic fallback.
         endpoints=(
             Endpoint("gitea", "https://dawn.wine/api/v1/repos/dawn-winery/dwproton/releases"),
             Endpoint("github", "https://api.github.com/repos/dawn-winery/dwproton-mirror/releases"),
@@ -154,23 +166,55 @@ class ProtonMgrError(Exception):
 # Paths, manifest and CPU detection
 # --------------------------------------------------------------------------
 
-def resolve_compat_dir(override: str | None) -> Path:
-    """Find (and create if needed) Steam's compatibilitytools.d folder."""
-    override = override or os.environ.get("PROTONMGR_DIR")
+def resolve_compat(override: str | None = None) -> tuple:
+    """Return (scan_dirs, primary_install_dir).
+
+    `scan_dirs` is every compatibilitytools.d folder that currently exists.
+    `primary_install_dir` is where new versions are extracted; it is created
+    if it does not exist yet.
+    """
     if override:
-        path = Path(override).expanduser()
-    else:
-        home = Path.home()
-        steam_roots = [
-            home / ".local/share/Steam",
-            home / ".steam/steam",
-            home / ".steam/root",
-            home / ".var/app/com.valvesoftware.Steam/data/Steam",   # Flatpak Steam
-        ]
-        root = next((r for r in steam_roots if r.is_dir()), steam_roots[0])
-        path = root / "compatibilitytools.d"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+        dirs = [Path(x).expanduser() for x in override.split(os.pathsep) if x.strip()]
+        if not dirs:
+            raise OSError("empty --dir value")
+        dirs[0].mkdir(parents=True, exist_ok=True)
+        return dirs, dirs[0]
+
+    multi = os.environ.get("PROTONMGR_DIRS")
+    if multi:
+        dirs = [Path(x).expanduser() for x in multi.split(os.pathsep) if x.strip()]
+        if dirs:
+            dirs[0].mkdir(parents=True, exist_ok=True)
+            return dirs, dirs[0]
+
+    single = os.environ.get("PROTONMGR_DIR")
+    if single:
+        path = Path(single).expanduser()
+        path.mkdir(parents=True, exist_ok=True)
+        return [path], path
+
+    home = Path.home()
+    steam_roots = [
+        home / ".local/share/Steam",
+        home / ".steam/steam",
+        home / ".steam/root",
+        home / ".var/app/com.valvesoftware.Steam/.local/share/Steam",
+        home / ".var/app/com.valvesoftware.Steam/.steam/root",
+        home / "snap/steam/common/.local/share/Steam",
+    ]
+
+    scan = []
+    for root in steam_roots:
+        compat = root / "compatibilitytools.d"
+        if compat.is_dir():
+            scan.append(compat)
+
+    if scan:
+        return scan, scan[0]
+
+    fallback = steam_roots[0] / "compatibilitytools.d"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return [fallback], fallback
 
 
 def config_dir() -> Path:
@@ -204,12 +248,7 @@ def save_manifest(manifest: dict) -> None:
 
 
 def detect_cpu_level() -> int:
-    """Return the x86-64 microarchitecture level of this CPU: 2, 3 or 4.
-
-    CachyOS publishes x86_64 (baseline), x86_64_v3 (AVX2) and x86_64_v4
-    (AVX-512) builds; this picks the best one the CPU can run.
-    Override with PROTONMGR_CPU_LEVEL=2|3|4.
-    """
+    """Return the x86-64 microarchitecture level of this CPU: 2, 3 or 4."""
     forced = os.environ.get("PROTONMGR_CPU_LEVEL")
     if forced in ("2", "3", "4"):
         return int(forced)
@@ -229,12 +268,37 @@ def detect_cpu_level() -> int:
 
 
 # --------------------------------------------------------------------------
+# Notifications (optional; silently no-op if no notifier is available)
+# --------------------------------------------------------------------------
+
+def desktop_notify(title: str, body: str, urgency: str = "normal") -> bool:
+    """Best-effort desktop notification via notify-send. Returns True if sent."""
+    if not shutil.which("notify-send"):
+        return False
+    try:
+        subprocess.run(
+            ["notify-send", "-a", APP_NAME, "-u", urgency, title, body],
+            check=False,
+            timeout=5,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def format_update_lines(updates: list) -> list:
+    """[ (branch, old, new) ] -> ['branch: old -> new', ...]."""
+    return [f"{branch}: {old} -> {new}" for branch, old, new in updates]
+
+
+# --------------------------------------------------------------------------
 # Networking: fetching release lists
 # --------------------------------------------------------------------------
 
 def http_get(url: str, accept: str = "application/json") -> bytes:
-    """GET a URL and return the body. Uses GITHUB_TOKEN for GitHub if set
-    (raises the anonymous rate limit of 60 requests/hour)."""
+    """GET a URL and return the body. Uses GITHUB_TOKEN for GitHub if set."""
     headers = {"User-Agent": USER_AGENT, "Accept": accept}
     token = os.environ.get("GITHUB_TOKEN")
     if token and "api.github.com" in url:
@@ -245,8 +309,7 @@ def http_get(url: str, accept: str = "application/json") -> bytes:
 
 
 def parse_release(raw: dict) -> Release | None:
-    """Convert one GitHub/Gitea release JSON object (same field names for the
-    parts we use) into a Release. Drafts are ignored."""
+    """Convert one GitHub/Gitea release JSON object into a Release."""
     if raw.get("draft") or not raw.get("tag_name"):
         return None
     assets = [
@@ -265,11 +328,7 @@ def parse_release(raw: dict) -> Release | None:
 
 
 def fetch_page(source: Source, page: int) -> tuple:
-    """Fetch one page of releases. Returns (releases, has_next_page, note).
-
-    Endpoints are tried in order; `note` explains a fallback when one was used.
-    Releases without any usable archive are dropped.
-    """
+    """Fetch one page of releases. Returns (releases, has_next_page, note)."""
     problems = []
     for index, endpoint in enumerate(source.endpoints):
         limit_param = "per_page" if endpoint.kind == "github" else "limit"
@@ -297,8 +356,7 @@ def fetch_page(source: Source, page: int) -> tuple:
 # --------------------------------------------------------------------------
 
 def candidate_archives(release: Release) -> list:
-    """Archives of a release that are plausible Proton builds for this PC
-    (supported archive type, not ARM, not a signed variant)."""
+    """Archives of a release that are plausible Proton builds for this PC."""
     result = []
     for asset in release.assets:
         name = asset.name.lower()
@@ -318,8 +376,8 @@ def asset_level(asset: Asset) -> int:
 
 
 def pick_asset(release: Release, cpu_level: int) -> Asset | None:
-    """Pick the best archive for this CPU: highest level it supports, and
-    prefer .gz/.xz over .zst (the .zst needs the external zstd tool)."""
+    """Pick the best archive for this CPU: highest level it supports, prefer
+    .gz/.xz over .zst (the .zst needs the external zstd tool)."""
     candidates = candidate_archives(release)
     if not candidates:
         return None
@@ -331,28 +389,18 @@ def pick_asset(release: Release, cpu_level: int) -> Asset | None:
 # Installed versions
 # --------------------------------------------------------------------------
 
-def installed_dirs(compat_dir: Path) -> list:
-    """Names of installed Proton folders (hidden/staging folders excluded)."""
-    try:
-        return sorted(
-            (p.name for p in compat_dir.iterdir() if p.is_dir() and not p.name.startswith(".")),
-            key=str.lower,
-        )
-    except OSError:
-        return []
-
-
 def tag_in_name(tag: str, name: str) -> bool:
-    """True if `tag` appears in `name` as a whole version, so that
-    'dwproton-11.0-1' does not match 'dwproton-11.0-15'."""
+    """True if `tag` appears in `name` as a whole version."""
     pattern = r"(?<![A-Za-z0-9])" + re.escape(tag) + r"(?![0-9])"
     return re.search(pattern, name, re.I) is not None
 
 
-def is_installed(source: Source, release: Release, dirs: list, manifest: dict) -> bool:
-    """Decide whether a release is already installed, using three signals:
-    this tool's install record, the release tag inside a folder name, or a
-    folder named exactly like one of the release's archives."""
+def is_installed(source: Source, release: Release, dirs, manifest: dict) -> bool:
+    """Decide whether a release is already installed.
+
+    `dirs` may be a list of folder names or a dict of {name: path}; both are
+    iterated as a plain sequence of names.
+    """
     for name in dirs:
         info = manifest.get(name) or {}
         if info.get("source") == source.key and info.get("tag") == release.tag:
@@ -414,11 +462,7 @@ def download(url: str, dest: Path, size_hint: int) -> None:
 
 
 def expected_checksum(release: Release, asset: Asset) -> tuple | None:
-    """Find a published checksum for an asset: (algorithm, hex) or None.
-
-    Looks first for a sibling '<name>.sha512sum' / '.sha256sum' file, then for
-    the digest GitHub attaches to every asset.
-    """
+    """Find a published checksum for an asset: (algorithm, hex) or None."""
     stem = ARCHIVE_RE.sub("", asset.name)
     wanted = {stem + s for s in CHECKSUM_SUFFIXES} | {asset.name + s for s in CHECKSUM_SUFFIXES}
     for other in release.assets:
@@ -454,18 +498,14 @@ def extract_archive(archive: Path, dest: Path) -> None:
         return
     with tarfile.open(archive) as tar:
         try:
-            tar.extractall(dest, filter="tar")     # Python 3.12+: blocks path escapes
+            tar.extractall(dest, filter="tar")
         except TypeError:
-            tar.extractall(dest)                   # older Python without filters
+            tar.extractall(dest)
 
 
 def install_release(source: Source, release: Release, asset: Asset,
                     compat_dir: Path, manifest: dict) -> list:
-    """Download, verify and extract one release. Returns the installed folder names.
-
-    Extraction happens in a hidden staging folder inside compatibilitytools.d
-    so a failed or interrupted install never leaves a half-unpacked version.
-    """
+    """Download, verify and extract one release. Returns the installed folder names."""
     cache_dir().mkdir(parents=True, exist_ok=True)
     archive = cache_dir() / asset.name
     staging = None
@@ -490,9 +530,9 @@ def install_release(source: Source, release: Release, asset: Asset,
         if not entries:
             raise ProtonMgrError("The archive was empty.")
         if len(entries) == 1 and entries[0].is_dir():
-            top_level = entries                              # normal Proton layout
+            top_level = entries
         else:
-            wrapper = staging / ARCHIVE_RE.sub("", asset.name)   # loose files: give them a folder
+            wrapper = staging / ARCHIVE_RE.sub("", asset.name)
             wrapper.mkdir()
             for entry in entries:
                 shutil.move(str(entry), str(wrapper / entry.name))
@@ -502,7 +542,7 @@ def install_release(source: Source, release: Release, asset: Asset,
         for entry in top_level:
             target = compat_dir / entry.name
             if target.exists() or target.is_symlink():
-                remove_path(target)                          # reinstall over the old copy
+                remove_path(target)
             shutil.move(str(entry), str(target))
             manifest[entry.name] = {"source": source.key, "tag": release.tag}
             installed.append(entry.name)
@@ -515,25 +555,16 @@ def install_release(source: Source, release: Release, asset: Asset,
 
 
 # --------------------------------------------------------------------------
-# Interface
-# --------------------------------------------------------------------------
-
-# --------------------------------------------------------------------------
 # Small helpers used by the screens
 # --------------------------------------------------------------------------
 
 def version_key(name: str) -> tuple:
-    """Sort key that orders folder names by the numbers inside them, so that
-    'GE-Proton11-11' sorts after 'GE-Proton11-3' (plain text sorting would not)."""
+    """Sort key that orders folder names by the numbers inside them."""
     return tuple(int(n) for n in re.findall(r"\d+", name))
 
 
 def old_versions(names: list, keep: int = 2) -> set:
-    """Folders that are older than the newest `keep` of their branch.
-
-    Only branches this tool knows (GE, CachyOS, DW) are considered; anything
-    else (UMU-Proton, hand-made folders) is never suggested for removal.
-    """
+    """Folders that are older than the newest `keep` of their branch."""
     groups = {}
     for name in names:
         branch = branch_of(name)
@@ -547,8 +578,7 @@ def old_versions(names: list, keep: int = 2) -> set:
 
 
 def dir_size(path: Path) -> int:
-    """Approximate size in bytes of everything under `path` (symlinks are not
-    followed, unreadable entries are skipped)."""
+    """Approximate size in bytes of everything under `path`."""
     total, stack = 0, [str(path)]
     while stack:
         current = stack.pop()
@@ -570,8 +600,7 @@ def dir_size(path: Path) -> int:
 
 
 def plain_markdown(text: str) -> str:
-    """Make GitHub release notes readable in a terminal: drop link targets,
-    bold markers, heading hashes and Windows line endings."""
+    """Make GitHub release notes readable in a terminal."""
     text = text.replace("\r", "")
     text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
     text = text.replace("**", "").replace("`", "")
@@ -580,7 +609,7 @@ def plain_markdown(text: str) -> str:
 
 
 def steam_is_running() -> bool:
-    """True if a Steam process is running (it must be restarted to see new tools)."""
+    """True if a Steam process is running."""
     try:
         return subprocess.run(["pgrep", "-x", "steam"], capture_output=True).returncode == 0
     except OSError:
@@ -595,9 +624,9 @@ def pause(message: str) -> None:
         print()
 
 
-# The download queue is one dict shared by every screen, so it survives
-# scrolling, filtering and switching between branches. Key: (source key,
-# release tag); value: (Source, Release). Insertion order is install order.
+# --------------------------------------------------------------------------
+# The download queue
+# --------------------------------------------------------------------------
 
 def queue_key(source: Source, release: Release) -> tuple:
     """Identity of a release inside the queue."""
@@ -605,8 +634,7 @@ def queue_key(source: Source, release: Release) -> tuple:
 
 
 def toggle_queue(queue: dict, source: Source, release: Release) -> bool:
-    """Add the release to the queue, or remove it if already there.
-    Returns True when it is queued afterwards."""
+    """Add the release to the queue, or remove it if already there."""
     key = queue_key(source, release)
     if key in queue:
         del queue[key]
@@ -625,7 +653,7 @@ def queue_total_size(queue: dict, cpu_level: int) -> int:
 
 
 # --------------------------------------------------------------------------
-# App state: what stays alive while you move between screens
+# App state
 # --------------------------------------------------------------------------
 
 @dataclass
@@ -638,8 +666,7 @@ class Feed:
     note: str = ""
 
     def load_more(self) -> None:
-        """Fetch the next page and append it. Raises ProtonMgrError on failure
-        and leaves the feed unchanged in that case."""
+        """Fetch the next page and append it. Raises ProtonMgrError on failure."""
         releases, has_next, note = fetch_page(self.source, self.next_page)
         known = {r.tag for r in self.releases}
         self.releases += [r for r in releases if r.tag not in known]
@@ -652,11 +679,30 @@ class Feed:
 @dataclass
 class App:
     """Shared state for the whole session."""
-    compat_dir: Path
+    compat_dir: Path              # primary install location (created on demand)
+    compat_dirs: list             # every compatibilitytools.d folder we scan
     manifest: dict
     cpu_level: int
     queue: dict = field(default_factory=dict)
     feeds: dict = field(default_factory=dict)
+
+    def installed(self) -> dict:
+        """Map folder name -> absolute path for every installed Proton version.
+
+        Scans all detected compatibilitytools.d folders, so a Flatpak install
+        and a native install both show up (first one wins if a name repeats).
+        """
+        found: dict = {}
+        for base in self.compat_dirs:
+            if not base.is_dir():
+                continue
+            try:
+                for entry in base.iterdir():
+                    if entry.is_dir() and not entry.name.startswith("."):
+                        found.setdefault(entry.name, entry)
+            except OSError:
+                continue
+        return found
 
     def feed(self, source: Source) -> Feed:
         """The (cached) release feed of a branch."""
@@ -664,9 +710,7 @@ class App:
 
 
 # --------------------------------------------------------------------------
-# Terminal layer: reads keys, paints rows. Everything above this layer talks
-# to a small interface (size / draw / key / suspended) so it can be tested
-# without a real terminal.
+# Terminal layer
 # --------------------------------------------------------------------------
 
 KEY_NAMES = {
@@ -723,7 +767,7 @@ class CursesUi:
             x = 0
             highlight = curses.A_REVERSE if y == cursor else 0
             for text, style in row:
-                room = width - x - (1 if y == height - 1 else 0)   # never touch the bottom-right cell
+                room = width - x - (1 if y == height - 1 else 0)
                 if room <= 0:
                     break
                 try:
@@ -865,7 +909,7 @@ def wrap_text(text: str, width: int) -> list:
 
 
 # --------------------------------------------------------------------------
-# Dialogs: confirm, message, text input, pager
+# Dialogs
 # --------------------------------------------------------------------------
 
 def dialog_lines(ui, lines: list, reserve: int) -> list:
@@ -989,8 +1033,7 @@ def queue_status_row(app: App) -> list:
 
 def plan_install(ui, app: App, items: list) -> list:
     """Ask the questions before installing; returns the final list (maybe empty)."""
-    dirs = installed_dirs(app.compat_dir)
-    already = [(s, r) for s, r in items if is_installed(s, r, dirs, app.manifest)]
+    already = [(s, r) for s, r in items if is_installed(s, r, app.installed(), app.manifest)]
     if already:
         lines = [f"{len(already)} of the selected versions are already installed:"]
         lines += [f"   {r.tag}" for _, r in already] + ["", "Skip them and install only the rest?"]
@@ -1013,8 +1056,7 @@ def plan_install(ui, app: App, items: list) -> list:
 
 def run_installs(items: list, app: App) -> tuple:
     """Install items one after another, printing progress. Returns
-    (installed [(source, release)], failed [tag]). One failure does not stop
-    the rest; Ctrl-C stops after cleaning up the current item."""
+    (installed [(source, release)], failed [tag])."""
     done, failed = [], []
     for position, (source, release) in enumerate(items, 1):
         print(f"\n[{position}/{len(items)}] {source.label}: {release.tag}")
@@ -1105,8 +1147,8 @@ def browse_screen(ui, app: App, source: Source) -> None:
     state, filter_text, show_pre = ListState(), "", True
     while True:
         visible = visible_releases(feed, filter_text, show_pre)
-        dirs = installed_dirs(app.compat_dir)
-        flags = [is_installed(source, r, dirs, app.manifest) for r in visible]
+        installed = app.installed()
+        flags = [is_installed(source, r, installed, app.manifest) for r in visible]
         _, width = ui.size()
 
         bits = [f"{len(visible)} shown"]
@@ -1202,7 +1244,18 @@ def updates_screen(ui, app: App) -> None:
                 latest = next((r for r in feed.releases if not r.prerelease),
                               feed.releases[0] if feed.releases else None)
                 results.append((source, latest, error or ("no releases found" if latest is None else "")))
-        dirs = installed_dirs(app.compat_dir)
+            # Fire the desktop notification the first time this screen opens
+            # with genuinely newer releases available. Only fires once per
+            # refresh, so keep the spam down without suppressing anything
+            # that the user would care about.
+            updates = compute_updates(results, app)
+            if updates:
+                lines = format_update_lines(updates)
+                desktop_notify(
+                    f"{APP_NAME}: {len(updates)} update(s) available",
+                    "\n".join(lines),
+                )
+        installed = app.installed()
         _, width = ui.size()
         body, selectable = [], []
         for source, latest, error in results:
@@ -1210,10 +1263,11 @@ def updates_screen(ui, app: App) -> None:
                 body.append([(f" {source.label.split(' (')[0]:<15} could not check: {error}", "bad")])
                 selectable.append(None)
             else:
-                flag = is_installed(source, latest, dirs, app.manifest)
+                flag = is_installed(source, latest, installed, app.manifest)
                 body.append(release_row(app, source, latest, flag, show_branch=True, new_label="[new]"))
                 selectable.append((source, latest))
-        missing = sum(1 for item in selectable if item and not is_installed(item[0], item[1], dirs, app.manifest))
+        missing = sum(1 for item in selectable
+                      if item and not is_installed(item[0], item[1], installed, app.manifest))
         header = header_rows("Check for updates",
                              "newest stable release of each branch - "
                              + (f"{missing} not installed yet" if missing else "you have them all"))
@@ -1231,7 +1285,7 @@ def updates_screen(ui, app: App) -> None:
             state.handle("down", len(body), avail)
         elif key == "a":
             for item in selectable:
-                if item and not is_installed(item[0], item[1], dirs, app.manifest):
+                if item and not is_installed(item[0], item[1], installed, app.manifest):
                     app.queue.setdefault(queue_key(*item), item)
         elif key == "enter":
             if app.queue:
@@ -1247,15 +1301,48 @@ def updates_screen(ui, app: App) -> None:
             return
 
 
+def compute_updates(results: list, app: App) -> list:
+    """Compare each branch's latest stable release with what is installed.
+
+    Returns [(branch_label, installed_tag_or_None, latest_tag)] for every
+    branch where the installed tag is older than the latest tag.
+
+    We only consider branches the tool manages and we treat an empty installed
+    set as "no update to show" - the user clearly just hasn't installed anything
+    yet, and the interactive "Check for updates" screen already shows that.
+    """
+    installed = app.installed()
+    manifest = app.manifest
+    updates = []
+    for source, latest, _error in results:
+        if latest is None:
+            continue
+        installed_tags = []
+        for name, _path in installed.items():
+            info = manifest.get(name) or {}
+            if info.get("source") == source.key and info.get("tag"):
+                installed_tags.append(info["tag"])
+            elif tag_in_name(latest.tag, name) or any(
+                    tag_in_name(installed_tag, name) for installed_tag in ()):
+                installed_tags.append(latest.tag) if tag_in_name(latest.tag, name) else None
+        # Only treat as updatable if the manifest records an older tag for
+        # this branch (that is what the user actually installed with us).
+        older = [tag for tag in installed_tags if tag != latest.tag]
+        if older:
+            newest_installed = max(older, key=version_key)
+            updates.append((source.label.split(" (")[0], newest_installed, latest.tag))
+    return updates
+
+
 def queue_screen(ui, app: App) -> None:
     """Everything selected for download, across all branches."""
     state = ListState()
     while True:
         entries = list(app.queue.values())
-        dirs = installed_dirs(app.compat_dir)
+        installed = app.installed()
         _, width = ui.size()
         header = header_rows("Download queue", "versions selected on any branch")
-        body = [release_row(app, s, r, is_installed(s, r, dirs, app.manifest), show_branch=True)
+        body = [release_row(app, s, r, is_installed(s, r, installed, app.manifest), show_branch=True)
                 for s, r in entries] or [[(" (the queue is empty)", "dim")]]
         footer = [queue_status_row(app)] + hint_rows(width, [
             ("Up/Down", "move"), ("Space", "remove"), ("c", "clear"), ("Enter", "install all"), ("Esc", "back")])
@@ -1279,22 +1366,23 @@ def installed_screen(ui, app: App) -> None:
     """Installed versions with sizes; select some and delete them."""
     state, selected, sizes = ListState(), set(), {}
     while True:
-        names = installed_dirs(app.compat_dir)
+        mapping = app.installed()
+        names = sorted(mapping.keys(), key=str.lower)
         missing = [n for n in names if n not in sizes]
         if missing:
             ui.draw(header_rows("Installed versions") + [[(" Measuring folders ...", "dim")]])
             for name in missing:
-                sizes[name] = dir_size(app.compat_dir / name)
+                sizes[name] = dir_size(mapping[name])
         selected &= set(names)
         _, width = ui.size()
 
         body = []
         for name in names:
             try:
-                modified = datetime.fromtimestamp((app.compat_dir / name).stat().st_mtime).strftime("%Y-%m-%d")
+                modified = datetime.fromtimestamp(mapping[name].stat().st_mtime).strftime("%Y-%m-%d")
             except OSError:
                 modified = "?"
-            mark = selected and name in selected
+            mark = name in selected
             body.append([(" [x] " if mark else " [ ] ", "warn" if mark else "normal"),
                          (f"{name:<46} ", "normal"), (f"{branch_of(name):<15} ", "dim"),
                          (f"{human_size(sizes[name]):>9}  ", "dim"), (modified, "dim")])
@@ -1302,7 +1390,10 @@ def installed_screen(ui, app: App) -> None:
             body = [[(" (nothing installed yet)", "dim")]]
         total = sum(sizes.get(n, 0) for n in names)
         picked = sum(sizes.get(n, 0) for n in selected)
-        header = header_rows("Installed versions", f"{app.compat_dir}")
+        subtitle = str(app.compat_dir)
+        if len(app.compat_dirs) > 1:
+            subtitle += f"  (scanning {len(app.compat_dirs)} folders)"
+        header = header_rows("Installed versions", subtitle)
         status = f" {len(names)} installed, {human_size(total)} on disk"
         if selected:
             status += f"   |   {len(selected)} selected ({human_size(picked)})"
@@ -1334,7 +1425,7 @@ def installed_screen(ui, app: App) -> None:
                 problems = []
                 for name in targets:
                     try:
-                        remove_path(app.compat_dir / name)
+                        remove_path(mapping[name])
                     except OSError as exc:
                         problems.append(f"{name}: {exc}")
                         continue
@@ -1352,7 +1443,7 @@ def root_screen(ui, app: App) -> None:
     """Main menu."""
     state = ListState()
     while True:
-        count = len(installed_dirs(app.compat_dir))
+        count = len(app.installed())
         entries = [("Installed versions", f"{count} installed", lambda: installed_screen(ui, app))]
         for source in SOURCES:
             entries.append((f"Browse {source.label}", "", lambda s=source: browse_screen(ui, app, s)))
@@ -1393,7 +1484,7 @@ def root_screen(ui, app: App) -> None:
 def run_tui(app: App) -> None:
     """Start the arrow-key interface in the current terminal."""
     locale.setlocale(locale.LC_ALL, "")
-    os.environ.setdefault("ESCDELAY", "25")          # make the Esc key respond quickly
+    os.environ.setdefault("ESCDELAY", "25")
     curses.wrapper(lambda screen: root_screen(CursesUi(screen), app))
 
 
@@ -1403,11 +1494,15 @@ def run_tui(app: App) -> None:
 
 def cli_list(app: App) -> int:
     """--list: print installed versions and exit."""
-    names = installed_dirs(app.compat_dir)
+    mapping = app.installed()
     print(f"Install folder: {app.compat_dir}")
-    if not names:
+    if len(app.compat_dirs) > 1:
+        print(f"Scanning {len(app.compat_dirs)} Steam folders:")
+        for path in app.compat_dirs:
+            print(f"  {path}")
+    if not mapping:
         print("(nothing installed)")
-    for name in names:
+    for name in sorted(mapping, key=str.lower):
         print(f"  {name:<48} {branch_of(name)}")
     return 0
 
@@ -1429,11 +1524,44 @@ def cli_install_latest(app: App, key: str) -> int:
     if release is None:
         print("No downloadable release found.")
         return 1
-    if is_installed(source, release, installed_dirs(app.compat_dir), app.manifest):
+    if is_installed(source, release, app.installed(), app.manifest):
         print(f"{release.tag} is already installed.")
         return 0
     done, failed = run_installs([(source, release)], app)
     return 1 if failed or not done else 0
+
+
+def cli_check_updates(app: App) -> int:
+    """--check-updates: fire a desktop notification if any branch is behind.
+
+    Exits 0 when everything is current, 2 when at least one branch has a newer
+    release (so a wrapper script can act on the result), and 1 on a hard error.
+    """
+    results = []
+    for source in SOURCES:
+        feed = Feed(source)
+        try:
+            feed.load_more()
+        except ProtonMgrError as exc:
+            print(f"{source.label}: could not fetch releases ({exc})")
+            results.append((source, None, str(exc)))
+            continue
+        latest = next((r for r in feed.releases if not r.prerelease),
+                      feed.releases[0] if feed.releases else None)
+        results.append((source, latest, ""))
+    updates = compute_updates(results, app)
+    if not updates:
+        print("Everything is up to date.")
+        return 0
+    lines = format_update_lines(updates)
+    title = f"{APP_NAME}: {len(updates)} update(s) available"
+    delivered = desktop_notify(title, "\n".join(lines))
+    print(title)
+    for line in lines:
+        print(f"  {line}")
+    if not delivered:
+        print("(install 'libnotify' to get a desktop popup from --check-updates)")
+    return 2
 
 
 def main() -> int:
@@ -1441,24 +1569,28 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Browse, install and remove Proton builds.")
     parser.add_argument("--dir", help="compatibilitytools.d folder to manage (default: auto-detect Steam)")
     parser.add_argument("--list", action="store_true", help="print the installed versions and exit")
+    parser.add_argument("--check-updates", action="store_true",
+                        help="report branches with newer releases and exit 2 if any (for timers)")
     parser.add_argument("--latest", metavar="BRANCH",
                         help="install the newest stable release of a branch and exit "
                              f"({', '.join(s.key for s in SOURCES)})")
     parser.add_argument("--version", action="version", version=f"{APP_NAME} {__version__}")
     args = parser.parse_args()
     try:
-        compat_dir = resolve_compat_dir(args.dir)
+        compat_dirs, compat_dir = resolve_compat(args.dir)
     except OSError as exc:
         print(f"Cannot use install folder: {exc}")
         return 1
-    app = App(compat_dir, load_manifest(), detect_cpu_level())
+    app = App(compat_dir, compat_dirs, load_manifest(), detect_cpu_level())
     try:
         if args.list:
             return cli_list(app)
+        if args.check_updates:
+            return cli_check_updates(app)
         if args.latest:
             return cli_install_latest(app, args.latest)
         if not (sys.stdin.isatty() and sys.stdout.isatty()):
-            print("protonmgr needs an interactive terminal. For scripts use --list or --latest BRANCH.")
+            print("protonmgr needs an interactive terminal. For scripts use --list or --check-updates.")
             return 2
         run_tui(app)
     except (KeyboardInterrupt, EOFError):
