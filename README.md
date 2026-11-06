@@ -146,17 +146,19 @@ game's Properties > Compatibility.
 
 ## Where it installs
 
-The first existing Steam folder from this list is used, with
-`compatibilitytools.d` inside it:
+By default, `protonmgr` automatically scans all known Steam locations (Native, Flatpak, Snap) and installs new versions into the first existing folder it finds. 
 
-1. `~/.local/share/Steam`
-2. `~/.steam/steam`
-3. `~/.steam/root`
-4. `~/.var/app/com.valvesoftware.Steam/data/Steam` (Flatpak Steam)
+If you use **Flatpak Steam**, it is highly recommended to explicitly set the install path to Steam's sandboxed directory so the versions immediately show up in the Steam UI.
 
-Override with `--dir PATH` or the `PROTONMGR_DIR` environment variable (the path
-must be the `compatibilitytools.d` folder itself).
+### Setting a Custom Install Folder (Flatpak Steam)
 
+You can tell `protonmgr` exactly where to install by using the `PROTONMGR_DIR` environment variable. 
+
+Add the following line to your shell configuration file (`~/.bashrc` for Bash, or `~/.zshrc` for Zsh):
+
+```bash
+
+export PROTONMGR_DIR="$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam/compatibilitytools.d"
 ## Environment variables
 
 | Variable | Purpose |

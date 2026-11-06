@@ -84,7 +84,7 @@ from pathlib import Path
 # --------------------------------------------------------------------------
 
 APP_NAME = "protonmgr"
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 USER_AGENT = f"{APP_NAME}/1.0 (terminal Proton version manager)"
 PAGE_SIZE = 30            # releases fetched per request when browsing online
 HTTP_TIMEOUT = 30         # seconds before a network request gives up
